@@ -198,6 +198,42 @@ SERVING_SHOULD_NEW = (
 )
 
 
+# ─── Sub-patch E: serving.py — call-site guard for tool_calls[0] ────────────
+# P64's widened _should_check returns True on finish_reason alone. The call
+# site in chat_completion_stream_generator then accesses tool_calls[0]
+# unconditionally → IndexError when the final delta has tool_calls=[].
+
+SERVING_CALLSITE_OLD = (
+    "                        if should_check and tool_parser and auto_tools_called:\n"
+    "                            latest_delta_len = 0\n"
+    "                            if (\n"
+    "                                isinstance(\n"
+    "                                    delta_message.tool_calls[0].function,\n"
+    "                                    DeltaFunctionCall,\n"
+    "                                )\n"
+    "                            ) and isinstance(\n"
+    "                                delta_message.tool_calls[0].function.arguments, str\n"
+    "                            ):\n"
+)
+
+SERVING_CALLSITE_NEW = (
+    "                        if should_check and tool_parser and auto_tools_called:\n"
+    "                            latest_delta_len = 0\n"
+    "                            # [Genesis P64 call-site guard] _should_check\n"
+    "                            # fires on finish_reason alone; tool_calls may\n"
+    "                            # be [] on the final delta — guard before [0].\n"
+    "                            if (\n"
+    "                                delta_message.tool_calls\n"
+    "                                and isinstance(\n"
+    "                                    delta_message.tool_calls[0].function,\n"
+    "                                    DeltaFunctionCall,\n"
+    "                                )\n"
+    "                            ) and isinstance(\n"
+    "                                delta_message.tool_calls[0].function.arguments, str\n"
+    "                            ):\n"
+)
+
+
 # ─── Sub-patch D: serving.py — _create_remaining_args_delta Pydantic fix ────
 
 SERVING_CRD_OLD = (
@@ -279,15 +315,17 @@ def _make_serving_patcher() -> TextPatcher | None:
         sub_patches=[
             TextPatch(name="p64_safety_net_widen", anchor=SERVING_SHOULD_OLD,
                       replacement=SERVING_SHOULD_NEW, required=True),
-            # NOTE: D sub-patch DUPLICATES the original return for the second
-            # half of _create_remaining_args_delta to keep the function shape
-            # syntactically valid (the original DeltaFunctionCall line
-            # continues into name= / arguments=). The duplicate emit is
-            # unreachable but preserves anchor stability for #D's tail.
-            # Simpler approach: only patch the safety-net (sub-patch C); leave
-            # _create_remaining_args_delta unchanged. The Pydantic null fix is
-            # belt-and-braces; the parser fix (sub-patches A+B) closes the
-            # primary symptom.
+            # Sub-patch E: guard tool_calls[0] access in chat_completion_stream_generator.
+            # P64's widened _should_check fires on finish_reason alone, so tool_calls
+            # may be [] on the final delta — IndexError without this guard.
+            TextPatch(name="p64_callsite_guard", anchor=SERVING_CALLSITE_OLD,
+                      replacement=SERVING_CALLSITE_NEW, required=True),
+            # Sub-patch D: Pydantic null fix for _create_remaining_args_delta.
+            # When original_tc is None (final delta has no tool_calls), passing
+            # id=None to DeltaToolCall raises "Expected 'id' to be a string".
+            # Post-construction assignment leaves the field unset instead.
+            TextPatch(name="p64_pydantic_id_fix", anchor=SERVING_CRD_OLD,
+                      replacement=SERVING_CRD_NEW, required=True),
         ],
         upstream_drift_markers=[
             "[Genesis P64 vllm#39598]",
